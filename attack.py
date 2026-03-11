@@ -220,4 +220,44 @@ def run_attack(args):
     pbar=tqdm(total=total_attacks,desc='Crafting adversarial samples')
 
     for imgs,labels in loader:
+        img=imgs[0].to(device)
+        sorce=labels[0].item()
+
+        pred_source=model.predict(img.unsueeze(0)).item()
+        if pred_source!= source:
+            for t in target_classes:
+                pbar.update(1)
+            continue
+
+        for target in target_classes:
+            if target==source:
+                pbar.update(1)
+                continue
+
+            x_adv,stats=attack.craft(img.unsqueeze(0),target_class=target,verbose=args.verbose)
+
+            results.add(
+                source=source,
+                target=target,
+                success=stats["success"],
+                distortion=stats['distortion'],
+                n_iter=stats["n_iter"]
+            )
+
+            attck_count+=1
+            pbar.update(1)
+
+            if args.verbose:
+                status='success' if stats['success'] else "fail"
+                print(
+                    f" {status} {source} ->{target}:"
+                    f"distortion ={stats['distortion']*100:.1f}%,"
+                    f"iters={stats['n_iter']}"
+                    
+                )
+
+                
+
+
+
             
