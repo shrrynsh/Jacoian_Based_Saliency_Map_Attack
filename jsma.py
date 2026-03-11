@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Set, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,10 +16,14 @@ def compute_jacobian(model: nn.Module, x: torch.Tensor, use_logits: bool = True)
 
     jacobian = torch.zeros(num_classes, num_features, device=x.device)
     for class_idx in range(num_classes):
-        if x.grad is not None:
-            x.grad.zero_()
-        outputs[0, class_idx].backward(retain_graph=(class_idx < num_classes - 1))
-        jacobian[class_idx] = x.grad.view(-1).detach().clone()
+        grads = torch.autograd.grad(
+            outputs=outputs[0, class_idx],
+            inputs=x,
+            retain_graph=(class_idx < num_classes - 1),
+            create_graph=False,
+            allow_unused=False,
+        )[0]
+        jacobian[class_idx] = grads.view(-1).detach()
 
     return jacobian
 
@@ -27,34 +31,40 @@ def compute_jacobian(model: nn.Module, x: torch.Tensor, use_logits: bool = True)
 def _saliency_pair(
     jacobian: torch.Tensor,
     target: int,
-    search_domain: Set[int],
+    search_mask: torch.Tensor,
     increase: bool,
 ) -> Tuple[int, int]:
     """Pick the best pixel pair according to JSMA saliency criterion."""
     target_grad = jacobian[target]
     other_grad = jacobian.sum(dim=0) - target_grad
 
-    domain = sorted(search_domain)
-    best_score = -1.0
-    best_p1, best_p2 = -1, -1
+    domain = torch.nonzero(search_mask, as_tuple=False).view(-1)
+    n = int(domain.numel())
+    if n < 2:
+        return -1, -1
 
-    for i, p in enumerate(domain):
-        for q in domain[i + 1 :]:
-            alpha = target_grad[p] + target_grad[q]
-            beta = other_grad[p] + other_grad[q]
+    t = target_grad.index_select(0, domain)
+    o = other_grad.index_select(0, domain)
 
-            if increase:
-                valid = alpha > 0 and beta < 0
-                score = float(alpha * (-beta)) if valid else -1.0
-            else:
-                valid = alpha < 0 and beta > 0
-                score = float((-alpha) * beta) if valid else -1.0
+    alpha = t[:, None] + t[None, :]
+    beta = o[:, None] + o[None, :]
 
-            if score > best_score:
-                best_score = score
-                best_p1, best_p2 = p, q
+    upper = torch.triu(torch.ones((n, n), dtype=torch.bool, device=jacobian.device), diagonal=1)
+    if increase:
+        valid = (alpha > 0) & (beta < 0) & upper
+        scores = torch.where(valid, alpha * (-beta), torch.full_like(alpha, -1.0))
+    else:
+        valid = (alpha < 0) & (beta > 0) & upper
+        scores = torch.where(valid, (-alpha) * beta, torch.full_like(alpha, -1.0))
 
-    return best_p1, best_p2
+    flat_scores = scores.view(-1)
+    best_flat = int(torch.argmax(flat_scores).item())
+    if float(flat_scores[best_flat].item()) < 0.0:
+        return -1, -1
+
+    i = best_flat // n
+    j = best_flat % n
+    return int(domain[i].item()), int(domain[j].item())
 
 
 def jsma_attack(
@@ -81,7 +91,7 @@ def jsma_attack(
     max_iter = int(num_features * max_distortion / 2.0)
 
     with torch.no_grad():
-        source_class = int(model.predict(x).item())
+        source_class = int(model.logits(x).argmax(dim=1).item())
 
     if source_class == target_class:
         return x_adv, {
@@ -92,13 +102,13 @@ def jsma_attack(
             "final_pred": source_class,
         }
 
-    search_domain: Set[int] = set(range(num_features))
+    search_mask = torch.ones(num_features, dtype=torch.bool, device=device)
     n_iter = 0
     current_pred = source_class
 
-    while current_pred != target_class and n_iter < max_iter and len(search_domain) >= 2:
+    while current_pred != target_class and n_iter < max_iter and int(search_mask.sum().item()) >= 2:
         jacobian = compute_jacobian(model, x_adv, use_logits=True)
-        p1, p2 = _saliency_pair(jacobian, target_class, search_domain, increase)
+        p1, p2 = _saliency_pair(jacobian, target_class, search_mask, increase)
 
         if p1 == -1:
             if verbose:
@@ -112,13 +122,13 @@ def jsma_attack(
         x_adv = x_adv_flat.view_as(x_adv)
 
         if x_adv_flat[p1].item() <= clip_min or x_adv_flat[p1].item() >= clip_max:
-            search_domain.discard(p1)
+            search_mask[p1] = False
         if x_adv_flat[p2].item() <= clip_min or x_adv_flat[p2].item() >= clip_max:
-            search_domain.discard(p2)
+            search_mask[p2] = False
 
         n_iter += 1
         with torch.no_grad():
-            current_pred = int(model.predict(x_adv).item())
+            current_pred = int(model.logits(x_adv).argmax(dim=1).item())
 
         if verbose:
             print(f"  [iter {n_iter:3d}] pred={current_pred}, target={target_class}")
